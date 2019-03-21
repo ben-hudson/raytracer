@@ -19,20 +19,23 @@ class Line(object):
         return '{}<p={}, d={}>'.format(self.__class__.__name__, self.p0, self.d)
 
     def intersects(self, seg):
-        a = np.dot(self.d, seg.n)
-        if np.abs(a) > self.eps:
-            b = np.dot(seg.p0 - self.p0, seg.n)
-            if np.abs(b) > self.eps:
-                d = b/a
-                return d
+        # https://math.stackexchange.com/questions/406864/intersection-of-two-lines-in-vector-form
+        A = np.vstack((self.d, -seg.d)).T
+        b = seg.p0 - self.p0
+        if np.abs(np.linalg.det(A)) > self.eps:
+            x = np.linalg.solve(A, b) # distance along each to intersection
+            # if distance along segment falls inside segment
+            if x[1] > 0 and x[1] < np.linalg.norm(seg.p1 - seg.p0) and x[0] > 0:
+                return x[0]
         return None
 
     def distance(self, point):
         u = point - self.p0
-        dt = np.dot(u, self.d) # tangential distance
-        # TODO: add normal to line and use this
-        dn = np.linalg.norm(u - self.d*dt) # normal distance
-        return dt, dn
+        # tangential distance
+        dt = np.dot(u, self.d)
+        # normal distance
+        dn = np.linalg.norm(u - self.d*dt.reshape((dt.shape[0], 1)), axis=1)
+        return np.vstack((dt, dn)).T
 
 class LineSegment(Line):
     def __init__(self, p0, p1):
@@ -43,9 +46,9 @@ class LineSegment(Line):
     def __repr__(self):
         return '{}<p=[{}, {}], n={}>'.format(self.__class__.__name__, self.p0, self.p1, self.n)
 
-    def contains(self, point):
-        dt, dn = self.distance(point)
-        return np.abs(dn) < self.eps and dt > 0 and dt <= np.linalg.norm(self.p1 - self.p0)
+    # def contains(self, point):
+    #     dt, dn = self.distance(point)
+    #     return np.abs(dn) < self.eps and dt > 0 and dt <= np.linalg.norm(self.p1 - self.p0)
 
 
 # raytracing-specific classes
@@ -76,8 +79,8 @@ class Boundary(LineSegment):
 
     # https://graphics.stanford.edu/courses/cs148-10-summer/docs/2006--degreve--reflection_refraction.pdf
     def reflect(self, ray):
-        if logger.isEnabledFor(logging.WARNING) and not self.contains(ray.p0):
-            logger.warn('Reflecting ray that does not originate on boundary')
+        # if logger.isEnabledFor(logging.WARNING) and not self.contains(ray.p0):
+        #     logger.warn('Reflecting ray that does not originate on boundary')
 
         # algorithm assumes edge normal is pointing towards ray
         if np.dot(ray.d, self.n) < 0:
@@ -93,17 +96,21 @@ class Boundary(LineSegment):
         return refl
 
     def refract(self, ray):
-        # print('refracting')
-        if logger.isEnabledFor(logging.WARNING) and not self.contains(ray.p0):
-            logger.warn('Refracting ray that does not originate on boundary')
+        # if logger.isEnabledFor(logging.WARNING) and not self.contains(ray.p0):
+        #     logger.warn('Refracting ray that does not originate on boundary')
 
         if np.dot(ray.d, self.n) < 0:
             n = self.n
-            n_ratio = self.n0/self.n1
+            n_out = self.n0
+            n_in = self.n1
+            # n_ratio = self.n0/self.n1
         else:
             n = -self.n
-            n_ratio = self.n1/self.n0
+            n_out = self.n1
+            n_in = self.n0
+            # n_ratio = self.n1/self.n0
         cosi = np.dot(-ray.d, n)
+        n_ratio = n_out/n_in
         sinisq = (n_ratio**2)*(1 - cosi**2)
 
         if sinisq <= 1:
@@ -112,7 +119,7 @@ class Boundary(LineSegment):
 
             refr = copy.deepcopy(ray)
             refr.d = d
-            refr.speed *= n_ratio
+            refr.speed = n_in*C
             return refr
         else:
             logger.debug('Total internal reflection')
@@ -120,7 +127,6 @@ class Boundary(LineSegment):
         return None
 
 class Obstacle(object):
-    """docstring for Polygon"""
     def __init__(self, vertices, n_out, n_in):
         super(Obstacle, self).__init__()
         self.vertices = vertices # vertices are in clock-wise order
@@ -136,14 +142,14 @@ class Obstacle(object):
         lines = [(e.dxf.start, e.dxf.end) for e in drawing.query('LINE')]
 
         while len(lines) > 0:
-            obstacle = [lines.pop(0)]
+            obstacle = [lines.pop(0)] # grab a line segment
             while True:
                 try:
                     # find line where start matches previous end
                     line_i = next(i for i, l in enumerate(lines) if l[0] == obstacle[-1][1])
                     line = lines.pop(line_i)
                     obstacle.append(line)
-                except StopIteration:
+                except StopIteration: # no more connecting lines
                     break
 
             # compute signed area
@@ -162,11 +168,9 @@ def closest_hit(ray, env):
     hits = []
     for obst in env:
         for b in obst.boundaries:
-            d = ray.intersects(b)
-            if d and d > 0:
-                p = ray.p0 + d*ray.d
-                if b.contains(p):
-                    hits.append((d, p, b))
+            d = ray.intersects(b) # this could be numpy-ified
+            if d:
+                hits.append((d, b))
     if len(hits) > 0:
         return min(hits, key=lambda x: x[0])
 
