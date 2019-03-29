@@ -1,156 +1,133 @@
 import numpy as np
-import copy
-import logging
 import ezdxf
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)
-
-# general geometry classes
-class Line(object):
-    def __init__(self, p0, d):
-        super(Line, self).__init__()
-        self.p0 = np.array(p0)
-        self.d = d / np.linalg.norm(d)
-
-        self.eps = 1e-6 # tolerance
-
-    def __repr__(self):
-        return '{}<p={}, d={}>'.format(self.__class__.__name__, self.p0, self.d)
-
-    def intersects(self, seg):
-        # https://math.stackexchange.com/questions/406864/intersection-of-two-lines-in-vector-form
-        A = np.vstack((self.d, -seg.d)).T
-        b = seg.p0 - self.p0
-        if np.abs(np.linalg.det(A)) > self.eps:
-            x = np.linalg.solve(A, b) # distance along each to intersection
-            # if distance along segment falls inside segment
-            if x[1] > 0 and x[1] < np.linalg.norm(seg.p1 - seg.p0) and x[0] > 0:
-                return x[0]
-        return None
-
-    def distance(self, point):
-        u = point - self.p0
-        # tangential distance
-        dt = np.dot(u, self.d)
-        # normal distance
-        dn = np.linalg.norm(u - self.d*dt.reshape((dt.shape[0], 1)), axis=1)
-        return np.vstack((dt, dn)).T
-
-class LineSegment(Line):
-    def __init__(self, p0, p1):
-        super(LineSegment, self).__init__(p0, np.array(p1) - np.array(p0))
-        self.p1 = np.array(p1)
-        self.n = np.array([-self.d[1], self.d[0]]) # ew
-
-    def __repr__(self):
-        return '{}<p=[{}, {}], n={}>'.format(self.__class__.__name__, self.p0, self.p1, self.n)
-
-    # def contains(self, point):
-    #     dt, dn = self.distance(point)
-    #     return np.abs(dn) < self.eps and dt > 0 and dt <= np.linalg.norm(self.p1 - self.p0)
-
-
-# raytracing-specific classes
 C = 299792458/1e9
 
-class Ray(Line):
-    def __init__(self, p0, d, tof=0, speed=C, depth=0):
-        super(Ray, self).__init__(p0, d)
-        self.tof = tof
-        self.speed = speed
-        self.depth = depth
+class Ray(object):
+    """docstring for Ray"""
+    def __init__(self, origin, direction, speed=C):
+        super(Ray, self).__init__()
+        self.origin = np.array(origin)
+        self.direction = direction / np.linalg.norm(direction)
 
-    def prop(self, dist):
-        self.p0 = self.p0 + self.d*dist
-        self.tof += dist/self.speed
-        self.depth += 1
+        self.tof = 0 # time of flight in ns
+        self.speed = speed # speed in m/ns
 
-    def __repr__(self):
-        return '{}<p={}, d={}, t={}>'.format(self.__class__.__name__, self.p0, self.d, self.tof)
+    def distance_to_points(self, points):
+        u = points - self.origin
+        d_tangential = np.dot(u, self.direction)
+        v = u - self.direction*d_tangential[:, np.newaxis]
+        d_normal = np.linalg.norm(v, axis=1)
+        return np.vstack((d_tangential, d_normal)).T
 
-class Boundary(LineSegment):
-    def __init__(self, p0, p1, n0, n1):
-        super(Boundary, self).__init__(p0, p1)
-        # refractive indices
-        # normal points towards n0
-        self.n0 = n0
-        self.n1 = n1
+    def distance_to_segments(self, segments):
+        # distance from point to line segments along direction
+        # nan if line does not intersect with segment
+        # segment directions
+        segments_d = segments[:, 1, :] - segments[:, 0, :]
+        segments_len = np.linalg.norm(segments_d, axis=1)
+        segments_d = segments_d / segments_len[:, np.newaxis]
+        # calculate intersections
+        # 2x2 matrix inverse might be faster than doing one big one
+        # https://math.stackexchange.com/questions/406864/intersection-of-two-lines-in-vector-form
+        distances = np.nan*np.ones(segments_d.shape[0])
+        for i in range(segments_d.shape[0]):
+            A = np.vstack((self.direction, -segments_d[i, :])).T
+            b = segments[i, 0, :] - self.origin
+            if np.abs(np.linalg.det(A)) > 1e-10:
+                x = np.linalg.solve(A, b) # distance along line and segment
+                # line intersects with segment if:
+                # distance along segment is > 0
+                # and distance along segment is < segment length
+                # and distance along line is > 0
+                if x[1] > 0 and x[1] <= segments_len[i] and x[0] > 1e-10: # this tolerance???
+                    distances[i] = x[0]
 
-    # https://graphics.stanford.edu/courses/cs148-10-summer/docs/2006--degreve--reflection_refraction.pdf
-    def reflect(self, ray):
-        # if logger.isEnabledFor(logging.WARNING) and not self.contains(ray.p0):
-        #     logger.warn('Reflecting ray that does not originate on boundary')
+        return distances
 
-        # algorithm assumes edge normal is pointing towards ray
-        if np.dot(ray.d, self.n) < 0:
-            n = self.n
+    def closest_hit(self, environment):
+        hits = self.distance_to_segments(environment.obstacles)
+        if np.isnan(hits).all():
+            return None, None
         else:
-            n = -self.n
-        cosi = np.dot(-ray.d, n)
-        d = ray.d + 2*cosi*n
-        d = d / np.linalg.norm(d)
+            i = np.nanargmin(hits)
+            return hits[i], environment[i]
 
-        refl = copy.deepcopy(ray)
-        refl.d = d
-        return refl
+    def propagate(self, distance):
+        self.origin = self.origin + distance*self.direction
+        self.tof += distance/self.speed
 
-    def refract(self, ray):
-        # if logger.isEnabledFor(logging.WARNING) and not self.contains(ray.p0):
-        #     logger.warn('Refracting ray that does not originate on boundary')
+    def reflect(self, boundary):
+        # https://graphics.stanford.edu/courses/cs148-10-summer/docs/2006--degreve--reflection_refraction.pdf
+        # direction and normal are pointing in towards eachother
+        normal = boundary.normal if np.dot(self.direction, boundary.normal) < 0 else -boundary.normal
+        cosi = np.dot(-self.direction, normal)
+        reflection = self.direction + 2*cosi*normal
+        self.direction = reflection / np.linalg.norm(reflection)
+        return True # success
 
-        if np.dot(ray.d, self.n) < 0:
-            n = self.n
-            n_out = self.n0
-            n_in = self.n1
-            # n_ratio = self.n0/self.n1
+    def refract(self, boundary):
+        # https://graphics.stanford.edu/courses/cs148-10-summer/docs/2006--degreve--reflection_refraction.pdf
+        # direction and normal are pointing in the same direction
+        if np.dot(self.direction, boundary.normal) < 0:
+            normal = boundary.normal
+            n_ratio = boundary.n[0]/boundary.n[1]
         else:
-            n = -self.n
-            n_out = self.n1
-            n_in = self.n0
-            # n_ratio = self.n1/self.n0
-        cosi = np.dot(-ray.d, n)
-        n_ratio = n_out/n_in
+            normal = -boundary.normal
+            n_ratio = boundary.n[1]/boundary.n[0]
+        cosi = np.dot(-self.direction, normal)
         sinisq = (n_ratio**2)*(1 - cosi**2)
 
         if sinisq <= 1:
-            d = n_ratio*ray.d +(n_ratio*cosi - np.sqrt(1 - sinisq))*n
-            d = d / np.linalg.norm(d)
-
-            refr = copy.deepcopy(ray)
-            refr.d = d
-            refr.speed = n_in*C
-            return refr
+            refraction = n_ratio*self.direction + (n_ratio*cosi - np.sqrt(1 - sinisq))*normal
+            self.direction = refraction / np.linalg.norm(refraction)
+            self.speed *= n_ratio
+            return True
         else:
-            logger.debug('Total internal reflection')
+            # total internal reflection
+            # no refraction
+            return False
 
-        return None
+class Boundary(object):
+    """docstring for Boundary"""
+    def __init__(self, geometry, n):
+        super(Boundary, self).__init__()
+        self.geometry = geometry
 
-class Obstacle(object):
-    def __init__(self, vertices, n_out, n_in):
-        super(Obstacle, self).__init__()
-        self.vertices = vertices # vertices are in clock-wise order
-        self.boundaries = [Boundary(*x, n_out, n_in) for x in zip(vertices, vertices[1:] + vertices[:1])]
+        self.direction = self.geometry[1, :] - self.geometry[0, :]
+        self.direction = self.direction / np.linalg.norm(self.direction)
+        self.normal = np.empty(self.direction.shape)
+        self.normal[0] = -self.direction[1]
+        self.normal[1] = self.direction[0]
 
-    def __repr__(self):
-        return '{}<v={}>'.format(self.__class__.__name__, self.vertices)
+        self.n = n # refractive indices
 
-    @staticmethod
-    def from_dxf(filename, ns, scale=1.0):
-        drawing = ezdxf.readfile(filename)
+class Environment(object):
+    """docstring for Environment"""
+    def __init__(self, dxf_file, refractive_indices, scale=1.0):
+        super(Environment, self).__init__()
+
+        obstacles = [] # line segments defined by start and end coordinates
+        interfaces = [] # boundaries defined by refractive index outside and inside (normal points out)
+
+        drawing = ezdxf.readfile(dxf_file)
         # splines must be exported as line segments
         lines = [(e.dxf.start, e.dxf.end) for e in drawing.query('LINE')]
 
         while len(lines) > 0:
-            obstacle = [lines.pop(0)] # grab a line segment
+            obstacle = [lines.pop(0)] # segment in a polygon
             while True:
                 try:
                     # find line where start matches previous end
                     line_i = next(i for i, l in enumerate(lines) if l[0] == obstacle[-1][1])
                     line = lines.pop(line_i)
                     obstacle.append(line)
-                except StopIteration: # no more connecting lines
+                except StopIteration: # end of polygon
                     break
+
+            # drop z component
+            if len(obstacle[0][0]) > 2:
+                obstacle = [(start[0:2], end[0:2]) for start, end in obstacle]
 
             # compute signed area
             # http://mathworld.wolfram.com/PolygonArea.html
@@ -158,20 +135,28 @@ class Obstacle(object):
             for start, end in obstacle:
                 A += start[0]*end[1] - start[1]*end[0]
             if A > 0:
-                obstacle.reverse()
+                # reverse order
+                obstacle = [(end, start) for start, end in obstacle]
 
-            n_out, n_in = ns.pop(0)
-            vertices = [(x*scale, y*scale) for (x, y, z), end in obstacle]
-            yield Obstacle(vertices, n_out, n_in)
+            refractive_index = refractive_indices.pop(0)
+            interface = [refractive_index]*len(obstacle) # same for every line segment in obstacle
 
-def closest_hit(ray, env):
-    hits = []
-    for obst in env:
-        for b in obst.boundaries:
-            d = ray.intersects(b) # this could be numpy-ified
-            if d:
-                hits.append((d, b))
-    if len(hits) > 0:
-        return min(hits, key=lambda x: x[0])
+            # seperate obstacles with a row of nans
+            obstacle.append(((np.nan, np.nan), (np.nan, np.nan)))
+            interface.append((np.nan, np.nan))
+            # and add to mega list
+            obstacles += obstacle
+            interfaces += interface
 
-    return None
+            self.obstacles = np.array(obstacles)*scale
+            self.interfaces = np.array(interfaces)
+
+    def __getitem__(self, key):
+        if type(key) is slice:
+            raise TypeError('Slices are not supported')
+            return None, None
+        if key < 0 or key >= len(self.obstacles):
+            raise IndexError('Index out of bounds')
+            return None, None
+
+        return Boundary(self.obstacles[key, :, :], self.interfaces[key, :])
