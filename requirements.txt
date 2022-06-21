@@ -6,7 +6,7 @@ conda==4.5.12
 cryptography==2.4.2
 ezdxf==0.9
 idna==2.8
-numpy==1.16.2
+numpy==1.22.0
 pycosat==0.6.3
 pycparser==2.19
 pyOpenSSL==18.0.0
